@@ -9,9 +9,9 @@ import fairscale.nn.model_parallel.initialize as fs_init
 import torch
 import torch.nn.functional as F
 from fairscale.nn.model_parallel.layers import (
-    ColumnParallelLinear,
-    ParallelEmbedding,
-    RowParallelLinear,
+    ColumnParallelLinear, #列并行
+    ParallelEmbedding, #
+    RowParallelLinear, #行并行
 )
 from torch import nn
 
@@ -160,7 +160,7 @@ def apply_rotary_emb(
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
-
+# 当使用分组attention的时候，先将kv值拷贝多份再reshape成local_head，该操作可以减少权重，但是并不能减少matmul运算数量
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
     bs, slen, n_kv_heads, head_dim = x.shape
@@ -199,14 +199,14 @@ class Attention(nn.Module):
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         model_parallel_size = fs_init.get_model_parallel_world_size()
-        self.n_local_heads = args.n_heads // model_parallel_size
-        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        self.head_dim = args.dim // args.n_heads
-
-        self.wq = ColumnParallelLinear(
-            args.dim,
-            args.n_heads * self.head_dim,
+        self.n_local_heads = args.n_heads // model_parallel_size #每一个卡上的head数量
+        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size #每一个卡上的kv_head数量
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads #每一张卡上的head/kv_head
+        self.head_dim = args.dim // args.n_heads #每一张卡上处理的维度/head数量
+        self.args = args
+        self.wq = ColumnParallelLinear( #Y=XA，它沿着Y的列切
+            args.dim, #k轴
+            args.n_heads * self.head_dim,#n轴
             bias=False,
             gather_output=False,
             init_method=lambda x: x,
@@ -235,7 +235,7 @@ class Attention(nn.Module):
 
         self.cache_k = torch.zeros(
             (
-                args.max_batch_size,
+                args.max_batch_size, 
                 args.max_seq_len,
                 self.n_local_kv_heads,
                 self.head_dim,
@@ -252,7 +252,7 @@ class Attention(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor, #[1,11, 4019]==[batch, seqlen, hidden]
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
@@ -273,16 +273,16 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim) #[batch, seqlen,num_head,head_dim]，multi head，类似reshape操作，但是不会进行拷贝[
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        self.cache_k = self.cache_k.to(xq)
+        self.cache_k = self.cache_k.to(xq)#将kv_cache拷贝到xq所在的卡
         self.cache_v = self.cache_v.to(xq)
 
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk #设置kv_cache,从
         self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
 
         keys = self.cache_k[:bsz, : start_pos + seqlen]
@@ -292,6 +292,7 @@ class Attention(nn.Module):
         keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
         values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
 
+        #transpose 之后每一个每一个head各算各的
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
         values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
@@ -301,7 +302,7 @@ class Attention(nn.Module):
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-        return self.wo(output)
+        return self.wo(output) #可以提升准确度的matmul，增加参数量
 
 
 class FeedForward(nn.Module):
@@ -467,7 +468,7 @@ class Transformer(nn.Module):
 
         """
         _bsz, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)
+        h = self.tok_embeddings(tokens) #[token_len,dim]
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
@@ -477,7 +478,7 @@ class Transformer(nn.Module):
                 (seqlen, seqlen), float("-inf"), device=tokens.device
             )
 
-            mask = torch.triu(mask, diagonal=1)
+            mask = torch.triu(mask, diagonal=1)#上三角
 
             # When performing key-value caching, we compute the attention scores
             # only for the new sequence. Thus, the matrix of scores is of size
